@@ -1,0 +1,6 @@
+.env
+node_modules/
+.vercel/
+pdfs/*
+!pdfs/.gitkeep
+data/db.json
