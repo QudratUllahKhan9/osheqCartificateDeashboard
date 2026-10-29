@@ -1,587 +1,410 @@
-
 /**
- * OSHEQ Certificate Backend
- * -------------------------
+ * server.js — OSHEQ Certificate engine (HTTP API)
+ * ------------------------------------------------
+ * Routes
+ *   GET  /api/status                  -> config + Cloudinary check (+ QR warnings)
+ *   POST /api/certificates            -> PDF render + Cloudinary upload + QR
+ *   GET  /api/certificates            -> list (Cloudinary = source of truth)
+ *   GET  /v/:id                       -> QR target: verified certificate page
+ *   GET  /api/verify/:id              -> old QR links -> redirect to /v/:id
+ *   GET  /api/qr/:id                  -> PNG of the QR (print/download)
+ *   GET  /pdfs/:file                  -> local PDF copy (dev)
+ *   GET  /api/health                  -> liveness
  *
- * POST /api/certificates
- * GET  /api/certificates
- * GET  /api/verify/:id
- * GET  /api/cloudinary-status
- * GET  /pdfs/:file
+ * THE ORDERING TRICK (why the QR always works):
+ *   localId (= sanitized certificate number) is created BEFORE the PDF is
+ *   rendered, and Cloudinary's public_id is derived from it:
+ *      osheq-certificates/pdf/<localId>.pdf
+ *      osheq-certificates/preview/<localId>
+ *   So the QR encodes  <PUBLIC_BASE_URL>/v/<localId>  — a public URL that is
+ *   already valid at render time and stays valid after the upload lands.
  */
-
 require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const QRCode = require('qrcode');
-const puppeteer = require('puppeteer-core');
-const chromium = require('@sparticuz/chromium');
 
+const { buildConfig } = require('./config');
 const { renderHtml, formatDate } = require('./template');
+const { renderCertificate } = require('./render');
+const { renderVerifyPage, renderNotFoundPage, esc } = require('./verifyPage');
 const db = require('./db');
-const cloudinary = require('./cloudinary');
+const cld = require('./cloudinary');
 
 const app = express();
-
+app.disable('x-powered-by');
 app.use(cors());
+app.use(express.json({ limit: '2mb' }));
 
-app.use(express.json({
-  limit: '2mb',
-}));
+const PORT = Number(process.env.PORT || 4000);
+const cfg = buildConfig(PORT);
 
-const PORT = process.env.PORT || 4000;
-
-const PUBLIC_BASE_URL = (
-  process.env.PUBLIC_BASE_URL ||
-  (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : `http://localhost:${PORT}`)
-).replace(/\/$/, '');
-
-// Vercel's deployment filesystem is read-only; only /tmp is writable.
-const PDF_DIR = process.env.VERCEL
-  ? path.join(require('os').tmpdir(), 'osheq-pdfs')
-  : path.join(__dirname, '..', 'pdfs');
-
+const WORK_DIR = process.env.VERCEL
+  ? path.join(os.tmpdir(), 'osheq-work')
+  : path.join(__dirname, '..', 'work');
+const PDF_DIR = path.join(WORK_DIR, 'pdf');
+const PNG_DIR = path.join(WORK_DIR, 'png');
 fs.mkdirSync(PDF_DIR, { recursive: true });
+fs.mkdirSync(PNG_DIR, { recursive: true });
 
+app.use('/pdfs', express.static(PDF_DIR));
+app.use('/previews', express.static(PNG_DIR));
 
-/* -------------------------------------------------------
-   Local PDF folder
-------------------------------------------------------- */
-
-app.use(
-  '/pdfs',
-  express.static(PDF_DIR, {
-    setHeaders: (res, filePath) => {
-      if (filePath.endsWith('.pdf')) {
-        res.setHeader(
-          'Content-Disposition',
-          'attachment'
-        );
-      }
-    },
-  })
-);
-
-
-/* -------------------------------------------------------
-   Helpers
-------------------------------------------------------- */
+/* ------------------------------------------------------------------ helpers */
 
 async function makeQrDataUrl(text) {
   return QRCode.toDataURL(text, {
     errorCorrectionLevel: 'M',
     margin: 0,
     width: 512,
-    color: {
-      dark: '#000000',
-      light: '#FFFFFF',
-    },
+    color: { dark: '#000000', light: '#FFFFFF' },
   });
 }
-
-
-async function htmlToPdf(html, outPath) {
-  // On Vercel, use the bundled Linux Chromium. Locally, CHROME_PATH can point
-  // to the installed Windows Chrome executable.
-  const isVercel = Boolean(process.env.VERCEL);
-  const executablePath = process.env.CHROME_PATH ||
-    (isVercel ? await chromium.executablePath() : null);
-
-  if (!executablePath) {
-    throw new Error(
-      'Chrome executable not configured. Set CHROME_PATH in .env for local Windows development.'
-    );
-  }
-
-  const launchOpts = {
-    executablePath,
-    headless: true,
-    args: isVercel ? chromium.args : [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--font-render-hinting=none',
-    ],
-  };
-
-  const browser = await puppeteer.launch(launchOpts);
-
-  try {
-    const page = await browser.newPage();
-
-    await page.setContent(html, {
-      waitUntil: 'networkidle0',
-    });
-
-    await page.evaluateHandle(
-      'document.fonts.ready'
-    );
-
-    await page.pdf({
-      path: outPath,
-      width: '210mm',
-      height: '297mm',
-      printBackground: true,
-      pageRanges: '1',
-    });
-  } finally {
-    await browser.close();
-  }
-}
-
 
 function autoCertNo() {
-  return String(
-    Math.floor(
-      10000000 +
-      Math.random() * 89999999
-    )
-  );
+  return String(Math.floor(10000000 + Math.random() * 89999999));
 }
 
+/** Certificate number -> safe, deterministic id (same cert no = same file). */
+function toLocalId(certNo) {
+  const safe = String(certNo || '').trim().replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 100);
+  if (!safe) return `cert-${Date.now()}`;
+  return safe.length >= 4 ? safe : `cert-${safe}`;
+}
 
-/* -------------------------------------------------------
-   Health
-------------------------------------------------------- */
+/* -------------------------------------------------------------------- status */
 
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+app.get('/api/status', async (req, res) => {
+  let cloudinaryOk = false;
+  let cloudinaryError = null;
+  if (cld.isConfigured()) {
+    try {
+      await cld.getPreview('__ping__');
+      cloudinaryOk = true;
+    } catch (err) {
+      cloudinaryError = err.message;
+    }
+  }
   res.json({
     ok: true,
-    cloudinary: cloudinary.isConfigured(),
+    cloudinaryConfigured: cld.isConfigured(),
+    cloudinaryReachable: cloudinaryOk,
+    cloudinaryError,
+    publicBaseUrl: cfg.publicBaseUrl,
+    qrTargetExample: `${cfg.publicBaseUrl}/v/CERT-NUMBER`,
+    warnings: cfg.warnings,
+    lanIps: cfg.lanIps,
+    isVercel: cfg.isVercel,
   });
 });
 
-
-/* -------------------------------------------------------
-   Cloudinary status
-------------------------------------------------------- */
-
-app.get('/api/cloudinary-status', (req, res) => {
-  res.json({
-    configured: cloudinary.isConfigured(),
-    qrMode: process.env.QR_MODE || 'verify',
-  });
-});
-
-
-/* -------------------------------------------------------
-   Certificates list
-------------------------------------------------------- */
-
-app.get('/api/certificates', async (req, res) => {
-  try {
-    // Cloudinary is the persistent source of truth on Vercel.
-    if (process.env.VERCEL && cloudinary.isConfigured()) {
-      return res.json(await cloudinary.listPdfs());
-    }
-    return res.json(db.list());
-  } catch (err) {
-    console.error('Certificate list error:', err);
-    return res.status(500).json({ error: 'Could not load certificates' });
-  }
-});
-
-
-/* -------------------------------------------------------
-   Generate Certificate
-------------------------------------------------------- */
+/* -------------------------------------------------------------------- create */
 
 app.post('/api/certificates', async (req, res) => {
-  try {
-    const {
-      name,
-      course = '',
-      provider = 'Safety Solution Pvt Ltd.',
-      date = '',
-      certNo: certNoIn = '',
-      saveToCloudinary = true,
-    } = req.body || {};
+  const body = req.body || {};
+  const name = String(body.name || '').trim();
+  const course = String(body.course || '').trim();
+  const provider = String(body.provider || 'Safety Solution Pvt Ltd.').trim();
+  const replace = body.replace === true || body.replace === 'true';
 
+  if (!name) return res.status(400).json({ error: 'Participant ka naam zaroori hai.' });
 
-    /* -----------------------------------------------
-       Validate
-    ------------------------------------------------ */
-
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({
-        error: 'Participant name is required',
-      });
-    }
-
-
-    /* -----------------------------------------------
-       Certificate number
-    ------------------------------------------------ */
-
-    const certNo = (
-      certNoIn ||
-      autoCertNo()
-    ).trim();
-
-
-    const dateText = formatDate(date);
-
-
-    const safeNo = certNo
-      .replace(/[^A-Za-z0-9_-]/g, '_');
-
-
-    /*
-     * This ID is generated BEFORE PDF creation.
-     *
-     * QR can therefore point to:
-     *
-     * https://your-domain.com/api/verify/local-id
-     */
-
-    const localId =
-      `${Date.now()}-${safeNo}`;
-
-
-    /* -----------------------------------------------
-       QR verification URL
-    ------------------------------------------------ */
-
-    const verifyUrl =
-      `${PUBLIC_BASE_URL}/api/verify/${localId}`;
-
-
-    /* -----------------------------------------------
-       QR
-    ------------------------------------------------ */
-
-    const qrDataUrl =
-      await makeQrDataUrl(verifyUrl);
-
-
-    /* -----------------------------------------------
-       HTML
-    ------------------------------------------------ */
-
-    if (process.env.VERCEL && !cloudinary.isConfigured()) {
-      return res.status(503).json({
-        error: 'Cloudinary must be configured on Vercel so generated PDFs persist after the request ends.',
-      });
-    }
-    if (process.env.VERCEL && !saveToCloudinary) {
-      return res.status(400).json({
-        error: 'Vercel deployments require saveToCloudinary=true so the PDF and QR verification link remain available.',
-      });
-    }
-
-    const html = renderHtml({
-      name: String(name).trim(),
-      course,
-      provider,
-      dateText,
-      certNo,
-      qrDataUrl,
+  if (cfg.isVercel && !cld.isConfigured()) {
+    return res.status(503).json({
+      error:
+        'Cloudinary env vars missing hain. Vercel par generated PDF persist nahi hoti, ' +
+        'is liye CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET add karna zaroori hai.',
     });
+  }
 
+  const certNo = String(body.certNo || '').trim() || autoCertNo();
+  const localId = toLocalId(certNo);
 
-    /* -----------------------------------------------
-       Local PDF
-    ------------------------------------------------ */
+  const existing = db.get(localId);
+  if (existing && !replace) {
+    return res.status(409).json({
+      error: `Certificate number "${certNo}" pehle se maujood hai. Naya number dein ya dobara generate karke update karein.`,
+      code: 'DUPLICATE_CERT_NO',
+      existing: { id: existing.id, certNo: existing.certNo, name: existing.name, verifyUrl: existing.verifyUrl },
+    });
+  }
 
-    const pdfPath = path.join(
-      PDF_DIR,
-      `${localId}.pdf`
-    );
+  const dateText = formatDate(body.date || '');
+  const verifyUrl = `${cfg.publicBaseUrl}/v/${encodeURIComponent(localId)}`;
+  const issuedAt = new Date().toISOString();
 
+  try {
+    /* 1. QR is generated from a URL that is valid NOW and AFTER upload */
+    const qrDataUrl = await makeQrDataUrl(verifyUrl);
 
-    await htmlToPdf(
-      html,
-      pdfPath
-    );
+    /* 2. Render PDF + preview PNG with one Chromium */
+    const html = renderHtml({ name, course, provider, dateText, certNo, qrDataUrl });
+    const pdfPath = path.join(PDF_DIR, `${localId}.pdf`);
+    const pngPath = path.join(PNG_DIR, `${localId}.png`);
+    await renderCertificate(html, { pdfPath, pngPath });
 
+    /* 3. Upload both to Cloudinary (deterministic public_id) */
+    let pdfUrl = null;
+    let previewUrl = null;
+    let previewDisplay = null;
+    let uploadError = null;
 
-    const displayName =
-      `${safeNo}.pdf`;
-
-
-    /* -----------------------------------------------
-       Cloudinary upload
-    ------------------------------------------------ */
-
-    let cloudinaryUrl = null;
-    let secureUrl = null;
-    let cloudinaryPublicId = null;
-
-
-    if (
-      cloudinary.isConfigured() &&
-      saveToCloudinary
-    ) {
-      const uploaded =
-        await cloudinary.uploadPdf(
-          pdfPath,
-          localId,
-          {
-            certNo,
-            name: String(name).trim(),
-            course,
-            provider,
-            dateText,
-            verifyUrl,
-          }
-        );
-
-
-      cloudinaryUrl =
-        uploaded.url || null;
-
-
-      secureUrl =
-        uploaded.secure_url || null;
-
-
-      cloudinaryPublicId =
-        uploaded.public_id || null;
+    if (cld.isConfigured()) {
+      const meta = { localId, certNo, name, course, provider, dateText, verifyUrl, issuedAt };
+      try {
+        const pdf = await cld.uploadPdf(pdfPath, localId, meta);
+        pdfUrl = pdf.secure_url || pdf.url || null;
+        const png = await cld.uploadPreview(pngPath, localId, meta);
+        previewUrl = png.secure_url || png.url || null;
+        previewDisplay = cld.previewDisplayUrl(png.public_id);
+      } catch (err) {
+        uploadError = err.message;
+        console.error('[cloudinary] upload failed:', err.message);
+      }
     }
 
+    const isLocal = !cld.isConfigured() || uploadError;
 
-    /* -----------------------------------------------
-       Final download URL
-    ------------------------------------------------ */
-
-    const downloadLink =
-      secureUrl ||
-      cloudinaryUrl ||
-      `${PUBLIC_BASE_URL}/pdfs/${localId}.pdf`;
-
-
-    /* -----------------------------------------------
-       Save database record
-    ------------------------------------------------ */
+    const signedPdf = pdfUrl ? cld.signedPdfUrl(localId) : null;
 
     const record = {
       id: localId,
-
-      certNo,
-
-      name: String(name).trim(),
-
-      course,
-
-      provider,
-
-      dateText,
-
       localId,
-
-      cloudinaryUrl,
-
-      secureUrl,
-
-      cloudinaryPublicId,
-
-      downloadLink,
-
+      certNo,
+      name,
+      course,
+      provider,
+      dateText,
       verifyUrl,
-
-      qrText: verifyUrl,
-
+      qrTarget: verifyUrl,
       qrDataUrl,
-
-      createdAt:
-        new Date().toISOString(),
+      pdfUrl: pdfUrl || `${cfg.publicBaseUrl}/pdfs/${localId}.pdf`,
+      previewUrl: previewDisplay || previewUrl || `${cfg.publicBaseUrl}/previews/${localId}.png`,
+      // Cloudinary blocks plain raw-PDF delivery (verified 401); signed URL opens.
+      downloadLink: signedPdf || `${cfg.publicBaseUrl}/pdfs/${localId}.pdf`,
+      pdfEndpoint: `${cfg.publicBaseUrl}/api/pdf/${encodeURIComponent(localId)}`,
+      storage: isLocal ? 'local' : 'cloudinary',
+      savedToCloudinary: Boolean(pdfUrl && !uploadError),
+      uploadError,
+      issuedAt,
+      createdAt: issuedAt,
+      // aliases kept so older frontend code keeps working
+      secureUrl: pdfUrl,
+      cloudinaryUrl: pdfUrl,
     };
 
+    db.upsert(record);
 
-    db.save(record);
+    if (uploadError) {
+      return res.status(502).json({
+        error:
+          `PDF ban gaya lekin Cloudinary upload fail hua — is QR se certificate nahi khulega. ` +
+          `Error: ${uploadError}`,
+        record,
+      });
+    }
 
-
-    /* -----------------------------------------------
-       Response
-    ------------------------------------------------ */
-
-    res.json(record);
-
+    return res.json(record);
   } catch (err) {
-
-    console.error(
-      'Certificate generation error:',
-      err
-    );
-
-    res.status(500).json({
-      error:
-        err.message ||
-        'Failed to generate certificate',
-    });
+    console.error('[create] failed:', err);
+    return res.status(500).json({ error: err.message || 'Certificate generate nahi hua.' });
   }
 });
 
+/* ---------------------------------------------------------------------- list */
 
-/* -------------------------------------------------------
-   QR Verification
-------------------------------------------------------- */
+app.get('/api/certificates', async (req, res) => {
+  try {
+    const local = db.all();
+    const localById = new Map(local.map((r) => [r.id, r]));
 
-app.get(
-  '/api/verify/:id',
-  async (req, res) => {
+    if (!cld.isConfigured()) return res.json(local);
 
+    let remote = [];
     try {
-
-      const localId = String(req.params.id || '');
-      let rec = db.get(localId);
-
-      // A Vercel serverless instance may not have the JSON record from the
-      // request that generated the certificate. Look up the persistent PDF.
-      if (!rec && cloudinary.isConfigured()) {
-        const asset = await cloudinary.getPdf(localId);
-        if (asset) {
-          return res.redirect(302, asset.secure_url || asset.url);
-        }
-      }
-
-      if (!rec) {
-        return res.status(404).send(`
-          <!doctype html><html><head><meta charset="utf-8">
-          <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>Certificate not found</title></head>
-          <body style="font-family:sans-serif;text-align:center;padding:40px">
-            <h2>❌ Certificate not found</h2>
-            <p>This certificate could not be verified.</p>
-          </body></html>
-        `);
-      }
-
-      if (rec.secureUrl || rec.cloudinaryUrl) {
-        return res.redirect(302, rec.secureUrl || rec.cloudinaryUrl);
-      }
-
-
-      /* -------------------------------------------
-         Local PDF fallback
-      ------------------------------------------- */
-
-      if (
-        req.accepts('html')
-      ) {
-
-        return res.send(`
-          <html>
-            <head>
-              <meta charset="utf-8">
-              <meta
-                name="viewport"
-                content="width=device-width,initial-scale=1"
-              >
-              <title>Certificate Verification</title>
-            </head>
-
-            <body
-              style="
-                font-family:sans-serif;
-                padding:30px;
-                text-align:center;
-              "
-            >
-
-              <h2>
-                ✅ Valid Certificate
-              </h2>
-
-              <p>
-                Certificate No:
-                <b>${escapeHtml(rec.certNo)}</b>
-              </p>
-
-              <p>
-                Name:
-                <b>${escapeHtml(rec.name)}</b>
-              </p>
-
-              <p>
-                Course:
-                ${escapeHtml(rec.course || '—')}
-              </p>
-
-              <p>
-                Provider:
-                ${escapeHtml(rec.provider)}
-              </p>
-
-              <p>
-                Date:
-                ${escapeHtml(rec.dateText)}
-              </p>
-
-              ${
-                rec.downloadLink
-                  ? `
-                    <p>
-                      <a
-                        href="${rec.downloadLink}"
-                        target="_blank"
-                      >
-                        Download Certificate PDF
-                      </a>
-                    </p>
-                  `
-                  : ''
-              }
-
-            </body>
-          </html>
-        `);
-
-      }
-
-
-      return res.json(rec);
-
+      remote = await cld.listCertificates();
     } catch (err) {
-
-      console.error(
-        'Verify error:',
-        err
-      );
-
-      res.status(500).json({
-        error:
-          err.message ||
-          'Verification failed',
-      });
+      console.warn('[list] cloudinary unavailable:', err.message);
+      return res.json(local);
     }
+
+    // Cloudinary is the truth; merge local-only rows (e.g. failed uploads).
+    const merged = remote.map((r) => {
+      const cached = localById.get(r.id) || {};
+      localById.delete(r.id);
+      return {
+        ...cached,
+        ...r,
+        qrDataUrl: cached.qrDataUrl || null,
+        savedToCloudinary: true,
+        storage: 'cloudinary',
+      };
+    });
+
+    return res.json([...merged, ...localById.values()]);
+  } catch (err) {
+    console.error('[list] failed:', err);
+    return res.status(500).json({ error: 'Certificates load nahi hue.' });
   }
-);
+});
 
+/* ----------------------------------------------------- QR target (the page) */
 
-/* -------------------------------------------------------
-   Escape HTML
-------------------------------------------------------- */
+async function resolveRecord(id) {
+  const cached = db.get(id);
+  if (cached) return { rec: cached, from: 'cache' };
 
-function escapeHtml(value) {
+  // Cold serverless instance: rebuild the record from Cloudinary metadata.
+  if (!cld.isConfigured()) return null;
 
-  return String(value || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+  const [pdf, img] = await Promise.all([cld.getPdf(id), cld.getPreview(id)]);
+  if (!pdf && !img) return null;
+
+  const ctx = (asset) => {
+    const c = (asset && asset.context && (asset.context.custom || asset.context)) || {};
+    return c;
+  };
+  const meta = { ...ctx(pdf), ...ctx(img) };
+  const resource = pdf || img;
+
+  return {
+    from: 'cloudinary',
+    rec: {
+      id,
+      localId: id,
+      certNo: meta.certNo || String(id).replace(/^cert-/, ''),
+      name: meta.name || '',
+      course: meta.course || '',
+      provider: meta.provider || 'Safety Solution Pvt Ltd.',
+      dateText: meta.dateText || '',
+      verifyUrl: meta.verifyUrl || `${cfg.publicBaseUrl}/v/${encodeURIComponent(id)}`,
+      issuedAt: meta.issuedAt || resource.created_at || null,
+      createdAt: resource.created_at || null,
+      pdfUrl: pdf ? pdf.secure_url || pdf.url : null,
+      previewUrl: img ? cld.previewDisplayUrl(img.public_id) : null,
+      // Signed at click time — plain raw PDF URLs are blocked (HTTP 401).
+      downloadLink: pdf ? `${cfg.publicBaseUrl}/api/pdf/${encodeURIComponent(id)}` : null,
+      savedToCloudinary: true,
+      storage: 'cloudinary',
+    },
+  };
 }
 
+app.get('/v/:id', async (req, res) => {
+  const id = String(req.params.id || '').slice(0, 120);
 
-/* -------------------------------------------------------
-   Start Server
-------------------------------------------------------- */
+  try {
+    const found = await resolveRecord(id);
+    if (!found) {
+      return res.status(404).type('html').send(renderNotFoundPage(id));
+    }
 
-// Vercel imports the Express app as a serverless function. Local development
-// still starts a normal HTTP server.
+    const { rec } = found;
+
+    if (req.query.format === 'json') return res.json(rec);
+
+    const previewSrc =
+      rec.previewUrl ||
+      (rec.savedToCloudinary && cld.isConfigured() ? cld.previewDisplayUrl(cld.imgPublicId(rec.id)) : null) ||
+      (rec.id ? `${cfg.publicBaseUrl}/previews/${rec.id}.png` : null);
+
+    return res.type('html').send(
+      renderVerifyPage({
+        rec,
+        previewSrc,
+        // Always route through our own endpoint: it mints a fresh signed
+        // Cloudinary download URL, because the plain one returns 401.
+        pdfHref: rec.downloadLink && /cloudinary/.test(String(rec.downloadLink))
+          ? `${cfg.publicBaseUrl}/api/pdf/${encodeURIComponent(rec.id)}`
+          : rec.downloadLink || rec.pdfUrl || null,
+        issuedAt: rec.issuedAt || rec.createdAt,
+        warning: cfg.warnings[0] || null,
+      })
+    );
+  } catch (err) {
+    console.error('[verify] failed:', err);
+    return res.status(500).type('html').send(renderNotFoundPage(id));
+  }
+});
+
+/* Old QR codes (already printed) pointed at /api/verify/:id — keep them alive. */
+app.get('/api/verify/:id', (req, res) => {
+  const id = String(req.params.id || '');
+  return res.redirect(302, `${cfg.publicBaseUrl}/v/${encodeURIComponent(id)}`);
+});
+
+/* ------------------------------------------------------- PDF download (signed)
+ * Cloudinary refuses public delivery of raw PDFs (HTTP 401) unless the account
+ * enables PDF/ZIP delivery. A SIGNED url returns 200 application/pdf, so we
+ * mint one per request and redirect. This is what the QR page links to.
+ */
+app.get('/api/pdf/:id', async (req, res) => {
+  const id = String(req.params.id || '');
+  try {
+    if (cld.isConfigured()) {
+      const signed = cld.signedPdfUrl(id, { attachment: req.query.inline !== '1' });
+      if (signed) {
+        const head = await fetch(signed, { method: 'HEAD' }).catch(() => null);
+        if (!head || head.status < 400) return res.redirect(302, signed);
+      }
+    }
+    const local = path.join(PDF_DIR, `${id}.pdf`);
+    if (fs.existsSync(local)) return res.sendFile(local);
+    return res.status(404).json({ error: 'PDF uplabdh nahi hai.' });
+  } catch (err) {
+    console.error('[pdf] failed:', err.message);
+    return res.status(500).json({ error: 'PDF download fail hua.' });
+  }
+});
+
+/* QR PNG for printing / manual sharing */app.get('/api/qr/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id || '');
+    const cached = db.get(id);
+    let target = cached ? cached.verifyUrl : `${cfg.publicBaseUrl}/v/${encodeURIComponent(id)}`;
+
+    if (req.query.target) target = String(req.query.target);
+
+    const buf = await QRCode.toBuffer(target, {
+      errorCorrectionLevel: 'M',
+      margin: 1,
+      width: 720,
+      type: 'png',
+    });
+    res.type('png').set('Cache-Control', 'public, max-age=3600').send(buf);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---------------------------------------------------------------- dev start */
+
+app.get('/', (req, res) =>
+  res.json({
+    service: 'OSHEQ Certificate Backend',
+    publicBaseUrl: cfg.publicBaseUrl,
+    routes: ['/api/status', '/api/certificates', '/v/:id', '/api/qr/:id'],
+  })
+);
+
 if (!process.env.VERCEL) {
   app.listen(PORT, () => {
     console.log('');
-    console.log('==========================================');
+    console.log('=================================================');
     console.log('✅ OSHEQ Certificate Backend');
-    console.log(`🚀 Running: ${PUBLIC_BASE_URL}`);
-    console.log(`☁️ Cloudinary: ${cloudinary.isConfigured() ? 'CONFIGURED' : 'NOT CONFIGURED'}`);
-    console.log('==========================================');
+    console.log(`🚀 ${cfg.publicBaseUrl}`);
+    console.log(`☁️  Cloudinary: ${cld.isConfigured() ? 'CONFIGURED' : 'NOT CONFIGURED'}`);
+    if (cfg.lanIps.length) console.log(`📱 LAN: ${cfg.lanIps.map((ip) => `http://${ip}:${PORT}`).join(' , ')}`);
+    cfg.warnings.forEach((w) => console.log(`⚠️  ${w}`));
+    console.log('=================================================');
   });
 }
 
 module.exports = app;
+module.exports.esc = esc;

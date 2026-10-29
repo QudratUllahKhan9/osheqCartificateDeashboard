@@ -1,12 +1,13 @@
 {
   "name": "osheq-certificate-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "commonjs",
   "main": "api/index.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node src/server.js"
+    "dev": "node src/server.js",
+    "check": "node -e \"require('./src/cloudinary');console.log('cloudinary.js ok')\""
   },
   "engines": {
     "node": ">=20.x"
