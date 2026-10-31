@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log
+.env
+.env.*
+!.env.example
+work
+pdfs/*.pdf
+data/db.json
+logs
+.git
+.gitignore
+test
+scripts
+README*.md
+DEPLOY.md
+.dockerignore

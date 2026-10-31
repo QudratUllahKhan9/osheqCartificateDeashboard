@@ -1,13 +1,17 @@
 {
   "name": "osheq-certificate-backend",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "commonjs",
   "main": "api/index.js",
+  "description": "OSHEQ certificate engine — PDF + QR + Cloudinary, portable Node service",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node src/server.js",
-    "check": "node -e \"require('./src/cloudinary');console.log('cloudinary.js ok')\""
+    "check": "node --check src/server.js && node --check src/render.js && node --check src/cloudinary.js && node --check src/config.js && node --check src/template.js && node --check src/verifyPage.js && node --check src/db.js",
+    "doctor": "node scripts/doctor.js",
+    "test:render": "node test/selfcheck.js nocloud",
+    "test:cloud": "node test/cloudinary-check.js"
   },
   "engines": {
     "node": ">=20.x"

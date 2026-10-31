@@ -37,15 +37,22 @@ const cld = require('./cloudinary');
 
 const app = express();
 app.disable('x-powered-by');
+
+// Behind nginx / Docker / any reverse proxy: needed for correct client IPs and
+// for req.protocol to report https, which /api/status uses for URL checks.
+app.set('trust proxy', true);
+
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
 const PORT = Number(process.env.PORT || 4000);
 const cfg = buildConfig(PORT);
 
-const WORK_DIR = process.env.VERCEL
-  ? path.join(os.tmpdir(), 'osheq-work')
-  : path.join(__dirname, '..', 'work');
+// WORK_DIR is configurable so a VPS can put renders on a bigger/other disk,
+// and containers can point at a writable volume. Never hardcode a machine path.
+const WORK_DIR =
+  process.env.WORK_DIR ||
+  (process.env.VERCEL ? path.join(os.tmpdir(), 'osheq-work') : path.join(__dirname, '..', 'work'));
 const PDF_DIR = path.join(WORK_DIR, 'pdf');
 const PNG_DIR = path.join(WORK_DIR, 'png');
 fs.mkdirSync(PDF_DIR, { recursive: true });
@@ -394,7 +401,7 @@ app.get('/', (req, res) =>
 );
 
 if (!process.env.VERCEL) {
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log('');
     console.log('=================================================');
     console.log('✅ OSHEQ Certificate Backend');
@@ -404,6 +411,16 @@ if (!process.env.VERCEL) {
     cfg.warnings.forEach((w) => console.log(`⚠️  ${w}`));
     console.log('=================================================');
   });
+
+  // Clean reload/stop under PM2 or `docker stop` — finish in-flight requests.
+  const shutdown = (signal) => () => {
+    console.log(`[shutdown] ${signal} received, closing server…`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 10000).unref();
+  };
+  process.on('SIGTERM', shutdown('SIGTERM'));
+  process.on('SIGINT', shutdown('SIGINT'));
+  process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', err));
 }
 
 module.exports = app;
