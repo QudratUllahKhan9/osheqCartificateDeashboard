@@ -1,0 +1,7 @@
+{
+  "name": "osheq-certificate-backend",
+  "build": "v5.0-pure-js",
+  "engine": "pdf-lib + @pdf-lib/fontkit + pureimage",
+  "browser": "none",
+  "builtAt": "2026-11-03T11:30:00.000Z"
+}

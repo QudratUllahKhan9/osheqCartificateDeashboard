@@ -1,105 +1,78 @@
+#!/usr/bin/env node
 /**
- * doctor.js — production readiness check. Run before/after deploy:
- *     npm run doctor
- * Prints PASS/FAIL for: env vars, browser binary, write access, Cloudinary
- * reachability, and the exact QR URL that will be printed on certificates.
+ * doctor.js — deployment self-check. Pure JS renderer, so there is NO browser
+ * to look for. Run: npm run doctor
  */
-require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const results = [];
-function check(name, ok, detail) {
-  results.push({ name, ok, detail });
+let hardFail = 0;
+let softFail = 0;
+
+function check(label, ok, detail = '', hard = true) {
+  console.log(`${ok ? '  PASS' : (hard ? '  FAIL' : '  WARN')}  ${label}${detail ? ' — ' + detail : ''}`);
+  if (!ok) { if (hard) hardFail++; else softFail++; }
+  return ok;
 }
-function section(title) {
-  console.log(`\n${title}`);
-}
 
-async function main() {
-  console.log('=== OSHEQ backend doctor ===');
-  console.log(`node ${process.version} | ${process.platform}/${process.arch} | cwd ${process.cwd()}`);
+(async () => {
+  console.log('\nOSHEQ backend — doctor\n');
 
-  /* ---------------------------------------------------------------- env */
-  section('-- environment');
-  const required = ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'];
-  const missing = required.filter((k) => !process.env[k]);
-  check('Cloudinary env vars', missing.length === 0, missing.length ? `missing: ${missing.join(', ')}` : 'all present');
-
-  const base = (process.env.PUBLIC_BASE_URL || '').trim();
-  check('PUBLIC_BASE_URL set', Boolean(base), base || 'not set');
-  check(
-    'PUBLIC_BASE_URL is public https',
-    /^https:\/\//i.test(base) && !/localhost|127\.0\.0\.1/i.test(base),
-    /^https:\/\//i.test(base) && !/localhost|127\.0\.0\.1/i.test(base)
-      ? 'ok — QR will work on any phone'
-      : 'WARNING: QR only works on this machine'
-  );
-
-  /* ------------------------------------------------------------ browser */
-  section('-- browser');
-  let browserOk = false;
-  try {
-    const { resolveExecutablePath } = require('../src/render');
-    const { executablePath } = await resolveExecutablePath();
-    browserOk = true;
-    check('Chromium/Chrome found', true, executablePath);
-  } catch (err) {
-    check('Chromium/Chrome found', false, err.message.split('\n')[0]);
+  /* 1. renderer modules (pure JS) */
+  console.log('renderer');
+  for (const m of ['pdf-lib', '@pdf-lib/fontkit', 'pureimage', 'qrcode']) {
+    try { require(m); check(m, true); } catch (e) { check(m, false, e.message.split('\n')[0]); }
   }
 
-  /* -------------------------------------------------------------- disk */
-  section('-- writable directories');
-  const workDir = process.env.WORK_DIR || path.join(__dirname, '..', 'work');
-  for (const dir of [workDir, path.join(workDir, 'pdf'), path.join(workDir, 'png')]) {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-      const probe = path.join(dir, `.probe-${Date.now()}`);
-      fs.writeFileSync(probe, 'ok');
-      fs.unlinkSync(probe);
-      check(`writable: ${dir}`, true, 'ok');
-    } catch (err) {
-      check(`writable: ${dir}`, false, err.message);
-    }
+  /* 2. assets */
+  console.log('\nassets');
+  const A = path.join(__dirname, '..', 'assets');
+  for (const f of ['bg_clean2.jpg', 'fonts/Montserrat.ttf', 'fonts/EBGaramond.ttf']) {
+    const p = path.join(A, f);
+    check(f, fs.existsSync(p) && fs.statSync(p).size > 1000,
+      fs.existsSync(p) ? fs.statSync(p).size + ' bytes' : 'missing');
   }
-  check('temp dir', true, os.tmpdir());
 
-  /* --------------------------------------------------------- cloudinary */
-  section('-- cloudinary');
-  try {
+  /* 3. writable work dir */
+  console.log('\nstorage');
+  const work = process.env.WORK_DIR || (process.env.VERCEL ? path.join(os.tmpdir(), 'osheq-work') : path.join(__dirname, '..', 'work'));
+  try { fs.mkdirSync(work, { recursive: true }); fs.writeFileSync(path.join(work, '.probe'), 'x'); fs.unlinkSync(path.join(work, '. probe'.replace(' ', ''))); check('work dir writable', true, work); }
+  catch (e) { check('work dir writable', false, work + ' — ' + e.message, false); }
+
+  /* 4. cloudinary */
+  console.log('\ncloudinary');
+  const okCfg = Boolean(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
+  check('env vars present', okCfg, okCfg ? process.env.CLOUDINARY_CLOUD_NAME : 'missing');
+  if (okCfg) {
     const cld = require('../src/cloudinary');
-    if (!cld.isConfigured()) {
-      check('Cloudinary configured', false, 'env vars missing');
-    } else {
-      check('Cloudinary configured', true, process.env.CLOUDINARY_CLOUD_NAME);
-      try {
-        await cld.listCertificates();
-        check('Cloudinary API reachable', true, 'list ok');
-      } catch (err) {
-        check('Cloudinary API reachable', false, err.message);
-      }
-    }
-  } catch (err) {
-    check('Cloudinary module', false, err.message);
+    try { const r = await cld.ping(); check('reachable', Boolean(r), JSON.stringify(r).slice(0, 80)); }
+    catch (e) { check('reachable', false, e.message.split('\n')[0], false); }
   }
 
-  /* -------------------------------------------------------------- print */
-  section('-- summary');
-  let failed = 0;
-  for (const r of results) {
-    if (!r.ok) failed += 1;
-    console.log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.name}${r.detail ? `\n        ${r.detail}` : ''}`);
-  }
+  /* 5. base urls */
+  console.log('\nurls');
+  const fe = process.env.PUBLIC_BASE_URL || '';
+  const be = process.env.BACKEND_BASE_URL || '';
+  console.log('  INFO  PUBLIC_BASE_URL  =', fe || '(unset → derived)');
+  console.log('  INFO  BACKEND_BASE_URL =', be || '(unset → derived from request host)');
+  const bad = v => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(v);
+  if (fe) check('PUBLIC_BASE_URL is public', !bad(fe), fe, false);
 
-  if (base) {
-    console.log(`\nQR target example: ${base}/v/90012345`);
-  }
-  console.log(`\n${failed === 0 ? 'ALL CHECKS PASSED' : `${failed} CHECK(S) FAILED`}`);
-  process.exit(failed === 0 ? 0 : 1);
-}
+  /* 6. real render */
+  console.log('\nrender test');
+  const { renderCertificate } = require('../src/render-pdf');
+  const { formatDate } = require('../src/template');
+  try {
+    const qrDataUrl = await require('qrcode').toDataURL('https://example.com/v/DOCTOR01', { width: 512, margin: 0 });
+    const out = path.join(work, 'doctor');
+    const r = await renderCertificate(
+      { name: 'Doctor Test', course: 'Safety Training', provider: 'Safety Solution Pvt Ltd.', dateText: formatDate('2026-11-03'), certNo: 'DOCTOR01', qrDataUrl },
+      { pdfPath: path.join(out, 'DOCTOR01.pdf'), pngPath: path.join(out, 'DOCTOR01.png') }
+    );
+    check('PDF + PNG generated', r.pdfBytes > 20000 && r.pngBytes > 20000, `pdf ${r.pdfBytes}B, png ${r.pngBytes}B`);
+  } catch (e) { check('PDF + PNG generated', false, e.message.split('\n')[0]); }
 
-main().catch((e) => {
-  console.error('doctor crashed:', e);
-  process.exit(1);
-});
+  console.log(`\n${hardFail ? 'FAILED' : 'ALL GOOD'} — hard failures: ${hardFail}, warnings: ${softFail}\n`);
+  process.exit(hardFail ? 1 : 0);
+})();

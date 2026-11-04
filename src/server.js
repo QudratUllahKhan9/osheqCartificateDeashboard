@@ -16,8 +16,10 @@
  *   rendered, and Cloudinary's public_id is derived from it:
  *      osheq-certificates/pdf/<localId>.pdf
  *      osheq-certificates/preview/<localId>
- *   So the QR encodes  <PUBLIC_BASE_URL>/v/<localId>  — a public URL that is
+ *   So the QR encodes  <BACKEND_BASE_URL>/v/<localId> — a public URL that is
  *   already valid at render time and stays valid after the upload lands.
+ *   NOTE: BACKEND_BASE_URL, NOT PUBLIC_BASE_URL — /v/<id> is this service's
+ *   route, so the QR must never point at the frontend dashboard domain.
  */
 require('dotenv').config();
 
@@ -28,9 +30,9 @@ const fs = require('fs');
 const os = require('os');
 const QRCode = require('qrcode');
 
-const { buildConfig } = require('./config');
+const { buildConfig, resolveCorsOrigins, warningsForRequest } = require('./config');
 const { renderHtml, formatDate } = require('./template');
-const { renderCertificate } = require('./render');
+const { renderCertificate } = require('./render-pdf');
 const { renderVerifyPage, renderNotFoundPage, esc } = require('./verifyPage');
 const db = require('./db');
 const cld = require('./cloudinary');
@@ -42,7 +44,17 @@ app.disable('x-powered-by');
 // for req.protocol to report https, which /api/status uses for URL checks.
 app.set('trust proxy', true);
 
-app.use(cors());
+// CORS is driven by PUBLIC_BASE_URL (= the FRONTEND dashboard).
+// No PUBLIC_BASE_URL set -> allow all (safe default for a fresh install).
+const corsOrigins = resolveCorsOrigins();
+app.use(
+  cors({
+    origin: process.env.PUBLIC_BASE_URL ? corsOrigins : true,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type'],
+    maxAge: 86400,
+  })
+);
 app.use(express.json({ limit: '2mb' }));
 
 const PORT = Number(process.env.PORT || 4000);
@@ -100,12 +112,21 @@ app.get('/api/status', async (req, res) => {
   }
   res.json({
     ok: true,
+    build: require('./build-info'),
     cloudinaryConfigured: cld.isConfigured(),
     cloudinaryReachable: cloudinaryOk,
     cloudinaryError,
-    publicBaseUrl: cfg.publicBaseUrl,
-    qrTargetExample: `${cfg.publicBaseUrl}/v/CERT-NUMBER`,
-    warnings: cfg.warnings,
+    // PUBLIC_BASE_URL = frontend dashboard. BACKEND_BASE_URL = this service.
+    frontendBaseUrl: cfg.frontendBaseUrl || null,
+    backendBaseUrl: cfg.backendBaseFor(req),
+    apiBaseUrl: cfg.backendBaseFor(req),
+    // QR always points at THIS backend (/v/<id> is a backend route).
+    qrTargetExample: `${cfg.backendBaseFor(req)}/v/CERT-NUMBER`,
+    corsOrigins: process.env.PUBLIC_BASE_URL ? corsOrigins : 'all',
+    // Live renderer diagnosis — tells you which engine is active.
+    // render failure visible from the browser instead of guessing.
+    browser: require('./render-pdf').browserDiagnostics(),
+    warnings: warningsForRequest(req, PORT),
     lanIps: cfg.lanIps,
     isVercel: cfg.isVercel,
   });
@@ -143,18 +164,21 @@ app.post('/api/certificates', async (req, res) => {
   }
 
   const dateText = formatDate(body.date || '');
-  const verifyUrl = `${cfg.publicBaseUrl}/v/${encodeURIComponent(localId)}`;
+  // QR target = BACKEND route, never the frontend domain.
+  const backendBase = cfg.backendBaseFor(req);
+  const verifyUrl = `${backendBase}/v/${encodeURIComponent(localId)}`;
   const issuedAt = new Date().toISOString();
 
   try {
     /* 1. QR is generated from a URL that is valid NOW and AFTER upload */
     const qrDataUrl = await makeQrDataUrl(verifyUrl);
 
-    /* 2. Render PDF + preview PNG with one Chromium */
-    const html = renderHtml({ name, course, provider, dateText, certNo, qrDataUrl });
+    /* 2. Render PDF + preview PNG (pure JavaScript) */
+    const certData = { name, course, provider, dateText, certNo, qrDataUrl };
     const pdfPath = path.join(PDF_DIR, `${localId}.pdf`);
     const pngPath = path.join(PNG_DIR, `${localId}.png`);
-    await renderCertificate(html, { pdfPath, pngPath });
+    // pure-JS renderer: pdf-lib for the PDF, pureimage for the preview.
+    await renderCertificate(certData, { pdfPath, pngPath });
 
     /* 3. Upload both to Cloudinary (deterministic public_id) */
     let pdfUrl = null;
@@ -191,11 +215,12 @@ app.post('/api/certificates', async (req, res) => {
       verifyUrl,
       qrTarget: verifyUrl,
       qrDataUrl,
-      pdfUrl: pdfUrl || `${cfg.publicBaseUrl}/pdfs/${localId}.pdf`,
-      previewUrl: previewDisplay || previewUrl || `${cfg.publicBaseUrl}/previews/${localId}.png`,
+      pdfUrl: pdfUrl || `${backendBase}/pdfs/${localId}.pdf`,
+      previewUrl: previewDisplay || previewUrl || `${backendBase}/previews/${localId}.png`,
       // Cloudinary blocks plain raw-PDF delivery (verified 401); signed URL opens.
-      downloadLink: signedPdf || `${cfg.publicBaseUrl}/pdfs/${localId}.pdf`,
-      pdfEndpoint: `${cfg.publicBaseUrl}/api/pdf/${encodeURIComponent(localId)}`,
+      downloadLink: signedPdf || `${backendBase}/pdfs/${localId}.pdf`,
+      pdfEndpoint: `${backendBase}/api/pdf/${encodeURIComponent(localId)}`,
+      qrPngUrl: `${backendBase}/api/qr/${encodeURIComponent(localId)}`,
       storage: isLocal ? 'local' : 'cloudinary',
       savedToCloudinary: Boolean(pdfUrl && !uploadError),
       uploadError,
@@ -263,7 +288,7 @@ app.get('/api/certificates', async (req, res) => {
 
 /* ----------------------------------------------------- QR target (the page) */
 
-async function resolveRecord(id) {
+async function resolveRecord(id, req) {
   const cached = db.get(id);
   if (cached) return { rec: cached, from: 'cache' };
 
@@ -290,13 +315,13 @@ async function resolveRecord(id) {
       course: meta.course || '',
       provider: meta.provider || 'Safety Solution Pvt Ltd.',
       dateText: meta.dateText || '',
-      verifyUrl: meta.verifyUrl || `${cfg.publicBaseUrl}/v/${encodeURIComponent(id)}`,
+      verifyUrl: meta.verifyUrl || `${cfg.backendBaseFor(req)}/v/${encodeURIComponent(id)}`,
       issuedAt: meta.issuedAt || resource.created_at || null,
       createdAt: resource.created_at || null,
       pdfUrl: pdf ? pdf.secure_url || pdf.url : null,
       previewUrl: img ? cld.previewDisplayUrl(img.public_id) : null,
       // Signed at click time — plain raw PDF URLs are blocked (HTTP 401).
-      downloadLink: pdf ? `${cfg.publicBaseUrl}/api/pdf/${encodeURIComponent(id)}` : null,
+      downloadLink: pdf ? `${cfg.backendBaseFor(req)}/api/pdf/${encodeURIComponent(id)}` : null,
       savedToCloudinary: true,
       storage: 'cloudinary',
     },
@@ -307,7 +332,8 @@ app.get('/v/:id', async (req, res) => {
   const id = String(req.params.id || '').slice(0, 120);
 
   try {
-    const found = await resolveRecord(id);
+    const found = await resolveRecord(id, req);
+    const backendBase = cfg.backendBaseFor(req);
     if (!found) {
       return res.status(404).type('html').send(renderNotFoundPage(id));
     }
@@ -319,7 +345,7 @@ app.get('/v/:id', async (req, res) => {
     const previewSrc =
       rec.previewUrl ||
       (rec.savedToCloudinary && cld.isConfigured() ? cld.previewDisplayUrl(cld.imgPublicId(rec.id)) : null) ||
-      (rec.id ? `${cfg.publicBaseUrl}/previews/${rec.id}.png` : null);
+      (rec.id ? `${backendBase}/previews/${rec.id}.png` : null);
 
     return res.type('html').send(
       renderVerifyPage({
@@ -328,7 +354,7 @@ app.get('/v/:id', async (req, res) => {
         // Always route through our own endpoint: it mints a fresh signed
         // Cloudinary download URL, because the plain one returns 401.
         pdfHref: rec.downloadLink && /cloudinary/.test(String(rec.downloadLink))
-          ? `${cfg.publicBaseUrl}/api/pdf/${encodeURIComponent(rec.id)}`
+          ? `${backendBase}/api/pdf/${encodeURIComponent(rec.id)}`
           : rec.downloadLink || rec.pdfUrl || null,
         issuedAt: rec.issuedAt || rec.createdAt,
         warning: cfg.warnings[0] || null,
@@ -343,7 +369,7 @@ app.get('/v/:id', async (req, res) => {
 /* Old QR codes (already printed) pointed at /api/verify/:id — keep them alive. */
 app.get('/api/verify/:id', (req, res) => {
   const id = String(req.params.id || '');
-  return res.redirect(302, `${cfg.publicBaseUrl}/v/${encodeURIComponent(id)}`);
+  return res.redirect(302, `${cfg.backendBaseFor(req)}/v/${encodeURIComponent(id)}`);
 });
 
 /* ------------------------------------------------------- PDF download (signed)
@@ -374,7 +400,7 @@ app.get('/api/pdf/:id', async (req, res) => {
   try {
     const id = String(req.params.id || '');
     const cached = db.get(id);
-    let target = cached ? cached.verifyUrl : `${cfg.publicBaseUrl}/v/${encodeURIComponent(id)}`;
+    let target = cached ? cached.verifyUrl : `${cfg.backendBaseFor(req)}/v/${encodeURIComponent(id)}`;
 
     if (req.query.target) target = String(req.query.target);
 
@@ -395,7 +421,8 @@ app.get('/api/pdf/:id', async (req, res) => {
 app.get('/', (req, res) =>
   res.json({
     service: 'OSHEQ Certificate Backend',
-    publicBaseUrl: cfg.publicBaseUrl,
+    frontendBaseUrl: cfg.frontendBaseUrl || null,
+    backendBaseUrl: cfg.backendBaseFor(req),
     routes: ['/api/status', '/api/certificates', '/v/:id', '/api/qr/:id'],
   })
 );
@@ -405,7 +432,9 @@ if (!process.env.VERCEL) {
     console.log('');
     console.log('=================================================');
     console.log('✅ OSHEQ Certificate Backend');
-    console.log(`🚀 ${cfg.publicBaseUrl}`);
+    console.log(`🚀 backend  : ${cfg.backendBaseUrl}`);
+    console.log(`🎨 frontend : ${cfg.frontendBaseUrl || '(PUBLIC_BASE_URL not set)'}`);
+    console.log(`🔗 CORS     : ${process.env.PUBLIC_BASE_URL ? corsOrigins.join(', ') : 'all origins'}`);
     console.log(`☁️  Cloudinary: ${cld.isConfigured() ? 'CONFIGURED' : 'NOT CONFIGURED'}`);
     if (cfg.lanIps.length) console.log(`📱 LAN: ${cfg.lanIps.map((ip) => `http://${ip}:${PORT}`).join(' , ')}`);
     cfg.warnings.forEach((w) => console.log(`⚠️  ${w}`));

@@ -1,0 +1,17 @@
+node_modules
+.git
+.env
+.env.*
+!.env.example
+work
+data
+logs
+test
+scripts
+deploy
+*.md
+!README.md
+Dockerfile
+.dockerignore
+ecosystem.config.js
+pdfs/*
